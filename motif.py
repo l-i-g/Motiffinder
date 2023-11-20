@@ -269,7 +269,7 @@ def explore_energies(model, X, y, energies):
     model.energies_=energies
     model.motif_length=len(energies)//4
     sub=generate_sub(X, model.motif_length)
-    binding=model.calculate_binding(sub,model.finalG0_,model.energies_)
+    binding,_=model.calculate_binding(sub,model.finalG0_,model.energies_)
     r=linregress(y, binding).rvalue
     df_pred=pd.DataFrame({'y': y, 'binding':binding})
     
@@ -401,7 +401,7 @@ class findmotif(BaseEstimator, RegressorMixin):
                  weight_ratio=0,
                  weight_information=0,
                  ftol=None, xtol=None,
-                 penalty_max=0.4, threshold_base = 17500, penalty_base=3E-9, kon=1e4, ratio_half_max=50):
+                 penalty_max=0.4, threshold_base = 17500, penalty_base=3E-9, kon=1e5, ratio_half_max=50):
 
         
         self.G0=G0                              #free energies of binding to an unspecific sequence, if set to None a sensible G0 is used
@@ -411,19 +411,19 @@ class findmotif(BaseEstimator, RegressorMixin):
         self.penalty_max=penalty_max            #penalty weight for deviation of max_binding from max_bind_target (required when G0 is fitted)
         
         self.protein_conc = protein_conc    #protein concentration used in binding experiment in uM
-        self.both_strands=both_strands      #True: reverse complement strand also considered (for double-stranded DNA)
+        self.both_strands=both_strands      #True: reverse complement strand also considered (for double-stranded nucleic acids)
         self.motif_length = motif_length    #length of subsequenz/motif
         
-        self.threshold_base = threshold_base         #base-specific energies above threshold base J/mol are penalized
+        self.threshold_base = threshold_base        #base-specific energies above threshold base J/mol are penalized
         self.penalty_base=penalty_base              #penalty weight for large base specific energies / position
          
         self.global_optimization=global_optimization    #local or global optimization
         self.start=start                                #(optional) initial guess for local optimization
         
         self.time_dissociation=time_dissociation    #time span [s] after binding experiment under conditions of dissociation
-        self.kon=kon                                #kon [M-1 s-1] association rate between protein and nucleic acid, 1E4 reasonable association rate
+        self.kon=kon                                #kon [M-1 s-1] association rate between protein and nucleic acid, 1E5 reasonable association rate
         
-        self.ratio_half_max=ratio_half_max                      #ratio_half_max=log(max/min) ===> r*(1+weight_ratio/2)
+        self.ratio_half_max=ratio_half_max          #ratio_half_max=log(max/min) ===> r*(1+weight_ratio/2)
         self.weight_ratio=weight_ratio              #r-value multiplied with (1+weight_ratio*ratio_half_max/(ratio_half_max+log(max/min))
         self.weight_information=weight_information  #weigth for taking into consideration the information content of the motif
         
@@ -437,20 +437,27 @@ class findmotif(BaseEstimator, RegressorMixin):
    
     def calculate_binding(self,sub,G0,energies):
         """G0: free energy of binding to unspecific sequence
-        energies: energy matrix as np.array(4*length of subsequence), postive or negative, if negative improve binding, energy of T is calculated so that all four energies add up to zero
+        energies: energy matrix as np.array(4*length of subsequence), postive or negative, if negative improve binding
         returns occupancy of each sequence as np.array(#number of sequences)
         """
         #this is the calculation for the forward probe sequence
         G=sub*energies #calculate energies for each base of all subsequences
         Gsub=np.apply_along_axis(sum, 2, G)+G0 #sum-up over all positions of a subsequence for each subsequence and add G0
-        f=lambda G: self.protein_conc/(self.protein_conc+(1/np.exp(-G/8.31/298)*1E6)) * np.exp(-self.time_dissociation*1/np.exp(-G/8.31/298)*self.kon)
-        #  (1/np.exp(-dG/R/T)*1E6) equals to Kd [uM]
+        
+        f_eq=lambda G: self.protein_conc/(self.protein_conc+(1/np.exp(-G/8.31/298)*1E6))
+        f_diss=lambda G: np.exp(-self.time_dissociation*1/np.exp(-G/8.31/298)*self.kon)
+
+        #  f_eq: (1/np.exp(-dG/R/T)*1E6) equals to Kd [uM]
         #  first part of expression represents fractional saturation at given protein concentration before dissociation
-        #  1/(-G/8.31/298)*kon = koff
+        #  f_diss: 1/(-G/8.31/298)*kon = koff
         #  np.exp(-dis_time*1/np.exp(-G/8.31/298)*kon) decrease due to dissociation
     
-        bindsub=f(Gsub)  #calculate binding occupancy at a subsequence
-        bind=np.apply_along_axis(sum, 1, bindsub) #cumulated occupancy over all subsubsequences (=over complete probe)
+        bindsub_eq=f_eq(Gsub)  #calculate binding occupancy at a subsequence
+        bindsub_diss=bindsub_eq*f_diss(Gsub)
+
+       
+        bind_eq=np.apply_along_axis(sum, 1, bindsub_eq) #cumulated occupancy over all subsubsequences (=over complete probe)
+        bind_diss=np.apply_along_axis(sum, 1, bindsub_diss)
         
         if self.both_strands:
             #calculate also for reverse strand if both strands must be analyzed (double-stranded DNA)
@@ -460,21 +467,25 @@ class findmotif(BaseEstimator, RegressorMixin):
             #Thus the reversed energies are in affect the reverse complement for the calculation
             G_rc=sub*energies_rc
             Gsub_rc=np.apply_along_axis(sum, 2, G_rc)+G0
-            bindsub_rc=f(Gsub_rc)
-            bindsub+=bindsub_rc #sum up occupancies on both strands
-            np.clip(bindsub,0,1,out=bindsub) # limit to maximal occupancy of 1 per subsite
-            bind=np.apply_along_axis(sum, 1, bindsub) #cumulated occupancy over all subsubsequences (=over complete probe)
+            bindsub_eq_rc=f_eq(Gsub_rc)
+            bindsub_diss_rc=bindsub_eq_rc*f_diss(Gsub_rc)            
+            bindsub_eq+=bindsub_eq_rc #sum up occupancies on both strands
+            bindsub_diss+=bindsub_diss_rc
+            np.clip(bindsub_eq,0,1,out=bindsub_eq) # limit to maximal occupancy of 1 per subsite
+            np.clip(bindsub_diss,0,1,out=bindsub_diss)
+            bind_eq=np.apply_along_axis(sum, 1, bindsub_eq) #cumulated occupancy over all subsubsequences (=over complete probe)
+            bind_diss=np.apply_along_axis(sum, 1, bindsub_diss)
         elif self.both_strands==False:
             pass
         else: 
             raise Exception("E: Boolean parameter both_strands not defined!")    
-        return bind
+        return bind_diss, bind_eq
     
     def calculateGforoccupancy(self, G, occupancy):
         """helper function to fit G so that occupancy is reached
         """
-        return (self.protein_conc/(self.protein_conc+(1/np.exp(-G/8.31/298)*1E6)) * np.exp(-self.time_dissociation*1/np.exp(-G/8.31/298)*self.kon)-occupancy) 
-    
+        #return (self.protein_conc/(self.protein_conc+(1/np.exp(-G/8.31/298)*1E6)) * np.exp(-self.time_dissociation*1/np.exp(-G/8.31/298)*self.kon)-occupancy) 
+        return (self.protein_conc/(self.protein_conc+(1/np.exp(-G/8.31/298)*1E6))-occupancy)     
     
     def fit(self, X, y):
         """X: hotencoded sequences as np.array(#sequences, #length_of_sequence*4)
@@ -522,10 +533,10 @@ class findmotif(BaseEstimator, RegressorMixin):
         # define wrapper functions for optimization with and without fitting G0
         def target(energies_ACG):  
             energies=acg2acgt(energies_ACG)
-            binding=self.calculate_binding(sub,G0,energies)
-            r=linregress(y, binding).rvalue  #regression (shall be positive)
+            binding_diss,_=self.calculate_binding(sub,G0,energies)
+            r=linregress(y, binding_diss).rvalue  #regression (shall be positive)
             penalty_base=np.sum(np.maximum(abs(energies)- self.threshold_base, 0)**2)*self.motif_length*self.penalty_base   #penalty if energy of a base is too high 
-            max_min=(max(binding)/max(min(binding),1e-10))                                                                  #or use log?
+            max_min=(max(binding_diss)/max(min(binding_diss),1e-10))                                                                  #or use log?
             factor_ratio= 1+self.weight_ratio*max_min/(self.ratio_half_max + max_min)-self.weight_ratio/2 # favor higher ratios
             exemption_information=self.weight_information*np.log(energies2information(energies)/self.motif_length) #favor more information content
             return -r*factor_ratio + penalty_base - exemption_information
@@ -534,11 +545,11 @@ class findmotif(BaseEstimator, RegressorMixin):
         def targetG0(G0energies_ACG):
             G0=G0energies_ACG[0]  # split-up parameters
             energies=acg2acgt(G0energies_ACG[1:])
-            binding=self.calculate_binding(sub, G0, energies)
-            r=linregress(y, binding).rvalue  #regression (shall be positive)
+            binding_diss,binding_eq=self.calculate_binding(sub, G0, energies)
+            r=linregress(y, binding_diss).rvalue  #regression (shall be positive)
             penalty_base=np.sum(np.maximum(abs(energies)- self.threshold_base, 0)**2)*self.motif_length*self.penalty_base   #penalty if energy of a base is too high 
-            penalty_maxbinding=np.log10(max(binding)/self.max_bind_target)**2*self.penalty_max                                            
-            max_min=(max(binding)/max(min(binding),1e-10))                                                 
+            penalty_maxbinding=np.log10(max(binding_eq)/self.max_bind_target)**2*self.penalty_max                                            
+            max_min=(max(binding_diss)/max(min(binding_diss),1e-10))                                                 
             factor_ratio= 1+self.weight_ratio*max_min/(self.ratio_half_max + max_min)-self.weight_ratio/2 # favor higher ratios
             exemption_information=self.weight_information*np.log(energies2information(energies)/self.motif_length) #favor more information content
             return -r*factor_ratio+penalty_base+penalty_maxbinding  - exemption_information
@@ -570,7 +581,7 @@ class findmotif(BaseEstimator, RegressorMixin):
             self.energies_=acg2acgt(res.x)
             self.finalG0_=G0
             
-        self.binding_fit=self.calculate_binding(sub,self.finalG0_, self.energies_)
+        self.binding_fit, self.binding_fit_eq=self.calculate_binding(sub,self.finalG0_, self.energies_)
         self.max_binding_fit=max(self.binding_fit)
         self.min_binding_fit=min(self.binding_fit)
         np.seterr(divide = 'ignore')
@@ -676,8 +687,8 @@ class findmotif(BaseEstimator, RegressorMixin):
             intercept=intercept_slope_energies_ACG[0]
             slope=intercept_slope_energies_ACG[1]
             energies=acg2acgt(intercept_slope_energies_ACG[2:])
-            binding=self.calculate_binding(sub,G0,energies)
-            y_pred=slope*binding+intercept
+            binding_diss, _=self.calculate_binding(sub,G0,energies)
+            y_pred=slope*binding_diss+intercept
             mae=mean_absolute_error(y, y_pred)
             penalty=np.sum(np.maximum(abs(energies)- self.threshold_base, 0)**2)/(self.penalty_base*self.motif_length) #penalty (is positive shall be small)
             #penalty=penalty-self.weight_ratio*min(2*np.log(max(binding)/max(min(binding),1e-20)),8)/8 #ratios above e^4=54 reduce penalty by weight_ratio FIXME could be also a factor to reduce r
@@ -695,7 +706,7 @@ class findmotif(BaseEstimator, RegressorMixin):
         self.intercept_=res.x[0]
         self.slope_=res.x[1]
         self.energies_=acg2acgt(res.x[2:])
-        self.binding_fit=self.calculate_binding(sub,self.finalG0_, self.energies_)
+        self.binding_fit, self.binding_fit_eq=self.calculate_binding(sub,self.finalG0_, self.energies_)
         self.max_binding_fit=max(self.binding_fit)
         self.min_binding_fit=min(self.binding_fit)
         y_pred=self.slope_*self.binding_fit+self.intercept_
@@ -709,7 +720,7 @@ class findmotif(BaseEstimator, RegressorMixin):
         check_is_fitted(self)
         X = check_array(X)
         sub=generate_sub(X, self.motif_length)
-        self.binding_predict=self.calculate_binding(sub,self.finalG0_,self.energies_)
+        self.binding_predict,_=self.calculate_binding(sub,self.finalG0_,self.energies_)
         y_pred=self.slope_*self.binding_predict+self.intercept_
         return y_pred
     
@@ -733,8 +744,8 @@ class findmotif(BaseEstimator, RegressorMixin):
             def target_single_5(energies_ACG_first_position, energies_core, sub): 
                 energies_first_position=acg2acgt(energies_ACG_first_position)
                 energies=np.concatenate((energies_first_position, energies_core))
-                binding=self.calculate_binding(sub,self.finalG0_,energies)
-                r=pearsonr(binding,y)[0] 
+                binding_diss,_=self.calculate_binding(sub,self.finalG0_,energies)
+                r=pearsonr(binding_diss,y)[0] 
                 return -r
             
 
@@ -754,8 +765,8 @@ class findmotif(BaseEstimator, RegressorMixin):
             def target_single_3(energies_ACG_last_position, energies_core,sub): 
                 energies_last_position=acg2acgt(energies_ACG_last_position)
                 energies=np.concatenate((energies_core, energies_last_position))
-                binding=self.calculate_binding(sub,self.finalG0_,energies)
-                r=pearsonr(binding,y)[0] 
+                binding_diss, _=self.calculate_binding(sub,self.finalG0_,energies)
+                r=pearsonr(binding_diss,y)[0] 
                 return -r
 
             sub=mf.generate_sub(X, len(start_energies)//4+1) #hotencoded sequence is split up in subsequences of motif length 
@@ -820,7 +831,7 @@ class findmotif(BaseEstimator, RegressorMixin):
         
         df_out=pd.DataFrame({'pos': range(length)})
         df_out['energies']=df_out['pos'].apply(lambda pos:np.array(([1,1,1,1]*pos+[0,0,0,0]*1+[1,1,1,1]*(length-pos-1))*self.energies_))
-        df_out['r']=df_out['energies'].apply(lambda e: linregress(y, self.calculate_binding(sub,self.finalG0_,e)).rvalue)
+        df_out['r']=df_out['energies'].apply(lambda e: linregress(y, self.calculate_binding(sub,self.finalG0_,e)[0]).rvalue)
         df_out['r under baseline']=df_out['r']-self.rvalue
         df_out['-2%']=df_out['r']<=self.rvalue*0.98
         fig, ax=plt.subplots()
@@ -839,7 +850,7 @@ class findmotif(BaseEstimator, RegressorMixin):
         # calculate occupancies over a range of G0 values
         sub=generate_sub(X, self.motif_length) 
         df_out = pd.DataFrame({'G0': np.arange(self.finalG0_-30000, self.finalG0_+30000, 1000)})  
-        df_out['binding']=df_out['G0'].apply(lambda G0: self.calculate_binding(sub, G0, self.energies_ ))
+        df_out['binding']=df_out['G0'].apply(lambda G0: self.calculate_binding(sub, G0, self.energies_ )[0])
         df_out['min binding']=df_out['binding'].apply(min)
         df_out['max binding']=df_out['binding'].apply(max)
         df_out['r']=df_out['binding'].apply(lambda binding: pearsonr(binding,y)[0])
